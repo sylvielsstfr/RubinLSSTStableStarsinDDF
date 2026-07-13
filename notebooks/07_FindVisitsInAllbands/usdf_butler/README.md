@@ -35,8 +35,7 @@ Variant of 01 that additionally keeps the visit MJD and DDF field for each
 detection, enabling light-curve-style diagnostics. Writes both
 `objectstats_band_<band>.parquet` (per-object stats) and
 `lcdeviation_band_<band>.parquet` (per-detection flux deviation vs. MJD)
-to `data_FindLSSTCamSources_01b/`. A `01b_..._backup.ipynb` copy is kept
-alongside it.
+to `data_FindLSSTCamSources_01b/`. 
 
 ### 02_ReadLSSTCamSourcesInAllbands.ipynb
 Offline companion to 01. Does **not** touch the Butler: reads back the
@@ -60,7 +59,6 @@ dispersion, standard-error error bars, etc.). Figures are written to
 usdf_butler/
 ├── 01_FindLSSTCamSourcesInAllbands.ipynb
 ├── 01b_FindLSSTCamSourcesInAllbands_keeptimeandfield.ipynb
-├── 01b_FindLSSTCamSourcesInAllbands_keeptimeandfield_backup.ipynb
 ├── 02_ReadLSSTCamSourcesInAllbands.ipynb
 ├── 02b_ReadLSSTCamSourcesInAllbands.ipynb
 ├── data_FindLSSTCamSources_01/       # parquet output of 01, input of 02
