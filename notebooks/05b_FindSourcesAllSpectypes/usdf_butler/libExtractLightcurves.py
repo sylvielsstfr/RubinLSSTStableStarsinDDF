@@ -16,6 +16,7 @@ Strategy to stay well below the RSP 16 GB limit:
 Author: Sylvie Dagoret-Campagne
 Affiliation: IJCLab/IN2P3/CNRS, Universite Paris-Saclay
 Created: 2026-06-27
+Updated: 2026-07-13
 """
 
 import argparse
@@ -436,6 +437,468 @@ def extract_lightcurves(
 
     pd.DataFrame(summary_rows).to_csv(out_summary_csv, index=False)
     log.info("Match summary saved -> %s", out_summary_csv)
+
+
+# ===========================================================================
+# CHUNKED / STREAMING MEMORY-SAFE VARIANTS
+#
+# Rationale for the 16 GB USDF JupyterHub kernels:
+#  1. `extract_lightcurves` above already streams matched rows to disk, but a
+#     single kernel run still walks through *every* target and *every*
+#     (visit, detector) ref with ONE Butler instance. The LSST Butler keeps
+#     internal registry/datastore caches that grow across many thousands of
+#     `.get()` calls and are NOT released by `gc.collect()` or `del`. Over a
+#     long target list this is the real source of the OOM crash, not the
+#     per-row Python objects (which are already freed).
+#  2. The fix here is twofold:
+#       a) let the notebook process only a CHUNK of the target list per
+#          kernel run (`process_target_chunk`), so you can restart the
+#          kernel between chunks and start from a clean process;
+#       b) *within* a chunk, periodically recreate the Butler object
+#          (`reset_butler_every`) so its internal caches are dropped even
+#          without restarting the kernel.
+#  3. Post-processing (CSV -> Parquet, per-star split, plots) is rewritten
+#     to stream through the data in pandas `chunksize` pages instead of
+#     loading the full light-curve table in memory, which was the *other*
+#     major memory spike in the original notebook (`df_lc = pd.read_csv(...)`
+#     followed by `df_lc.to_parquet(...)` and `save_per_star(df_lc, ...)`).
+# ===========================================================================
+
+
+def process_target_chunk(
+    repo: str,
+    collections: list[str],
+    df_targets_chunk: pd.DataFrame,
+    timespan: Timespan,
+    ra_col: str,
+    dec_col: str,
+    id_col: str,
+    src_columns_avail: list[str],
+    match_radius_arcsec: float,
+    out_csv: str,
+    out_summary_csv: str,
+    reset_butler_every: int = 5,
+    resume: bool = True,
+) -> None:
+    """Memory-bounded, resumable variant of `extract_lightcurves`.
+
+    Differences from `extract_lightcurves`:
+      - Takes `repo`/`collections` instead of a pre-built `Butler` and
+        creates/recreates the Butler itself, so its internal caches can be
+        periodically released via `reset_butler_every`.
+      - `out_csv`/`out_summary_csv` are expected to be CHUNK-SPECIFIC paths
+        (e.g. suffixed with `_chunk00_of_10.csv`) so several kernel runs
+        (one per chunk, ideally each in a fresh kernel) never collide.
+      - If `resume=True` and `out_summary_csv` already exists (e.g. the
+        previous run OOM'd partway through this chunk), targets already
+        recorded there are skipped, and the summary is flushed to disk
+        after *every* target (not just at the end) so a crash never loses
+        more than one target's worth of progress.
+    """
+    skip_in_row = {
+        ra_col,
+        dec_col,
+        id_col,
+        "visit",
+        "detector",
+        "band",
+        "day_obs",
+        "physical_filter",
+    }
+    photo_cols = [c for c in src_columns_avail if c not in skip_in_row]
+
+    # ── Resume bookkeeping ──────────────────────────────────────────────
+    done_ids: set[str] = set()
+    summary_rows: list[dict] = []
+    if resume and os.path.exists(out_summary_csv):
+        try:
+            prev = pd.read_csv(out_summary_csv)
+            summary_rows = prev.to_dict("records")
+            done_ids = set(prev["simbad_id"].astype(str))
+            log.info("Resume: %d targets already done in this chunk, skipping them", len(done_ids))
+        except Exception as exc:
+            log.warning("Could not read existing summary for resume (%s) - starting fresh", exc)
+
+    # ── CSV header (only if the file does not already exist) ───────────
+    if not os.path.exists(out_csv):
+        header_row: dict = {
+            "simbad_id": "",
+            "target_ra": 0.0,
+            "target_dec": 0.0,
+            "visit": 0,
+            "detector": 0,
+            "band": "",
+            "day_obs": 0,
+            "physical_filter": "",
+            "sep_arcsec": 0.0,
+            "src_ra": 0.0,
+            "src_dec": 0.0,
+            "sourceId": 0,
+        }
+        for c in photo_cols:
+            header_row[c] = 0.0
+        pd.DataFrame([header_row]).head(0).to_csv(out_csv, index=False)
+
+    butler = Butler(repo, collections=collections)
+    log.info("Chunk processing: %d targets, reset_butler_every=%d", len(df_targets_chunk), reset_butler_every)
+
+    n_processed_since_reset = 0
+    for idx, target in df_targets_chunk.iterrows():
+        simbad_id = target["simbad_id"]
+
+        if resume and str(simbad_id) in done_ids:
+            log.info("[%3d] %s  -> already processed, skipping (resume)", idx, simbad_id)
+            continue
+
+        if n_processed_since_reset > 0 and n_processed_since_reset % reset_butler_every == 0:
+            log.info("  -- recreating Butler to release internal caches --")
+            del butler
+            gc.collect()
+            butler = Butler(repo, collections=collections)
+
+        ra_t = float(target["ra_deg"])
+        dec_t = float(target["dec_deg"])
+        tgt_sky = SkyCoord(ra=ra_t * u.deg, dec=dec_t * u.deg)
+
+        log.info("[%3d] %s  ra=%.5f  dec=%+.5f", idx, simbad_id, ra_t, dec_t)
+
+        try:
+            refs = list(
+                butler.query_datasets(
+                    "source",
+                    where=(
+                        "visit.timespan OVERLAPS :timespan AND "
+                        "visit_detector_region.region OVERLAPS POINT(:ra, :dec)"
+                    ),
+                    bind={"timespan": timespan, "ra": ra_t, "dec": dec_t},
+                )
+            )
+        except Exception as exc:
+            log.error("  ERROR querying refs: %s", exc)
+            summary_rows.append(
+                {
+                    "simbad_id": simbad_id,
+                    "ra_deg": ra_t,
+                    "dec_deg": dec_t,
+                    "n_refs": 0,
+                    "n_matched": 0,
+                    "n_failed": 0,
+                    "status": "query_error",
+                }
+            )
+            pd.DataFrame(summary_rows).to_csv(out_summary_csv, index=False)
+            n_processed_since_reset += 1
+            continue
+
+        log.info("  -> %d refs (visit x detector pairs)", len(refs))
+
+        n_matched = 0
+        n_failed = 0
+        batch: list[dict] = []
+
+        for count, ref in enumerate(refs):
+            did = ref.dataId
+            visit = did["visit"]
+            band = did.get("band", "?")
+            day_obs = did.get("day_obs", -1)
+            detector = did.get("detector", -1)
+            physical_filter = did.get("physical_filter", "?")
+
+            if count % 50 == 0:
+                log.info(
+                    "    ref %d/%d  visit=%s  band=%s  day_obs=%s", count, len(refs), visit, band, day_obs
+                )
+
+            df_src = None
+            try:
+                df_src = butler.get(ref, parameters={"columns": src_columns_avail})
+                if not isinstance(df_src, pd.DataFrame):
+                    df_src = df_src.to_pandas()
+            except Exception as exc:
+                log.warning("    WARNING: could not load ref (visit=%s det=%s): %s", visit, detector, exc)
+                n_failed += 1
+                continue
+
+            if df_src is None or len(df_src) == 0:
+                n_failed += 1
+                del df_src
+                continue
+
+            ra_arr = df_src[ra_col].values
+            dec_arr = df_src[dec_col].values
+            unit_sky = u.rad if float(ra_arr.max()) <= 2 * np.pi + 0.1 else u.deg
+            cat_sky = SkyCoord(ra=ra_arr * unit_sky, dec=dec_arr * unit_sky)
+
+            best_i, sep2d, _ = tgt_sky.match_to_catalog_sky(cat_sky)
+            sep_arcsec = float(sep2d.to(u.arcsec).value)
+
+            if sep_arcsec > match_radius_arcsec:
+                del df_src, ra_arr, dec_arr, cat_sky
+                continue
+
+            n_matched += 1
+            matched = df_src.iloc[best_i]
+
+            m_ra = float(matched[ra_col])
+            m_dec = float(matched[dec_col])
+            if unit_sky == u.rad:
+                m_ra = np.degrees(m_ra)
+                m_dec = np.degrees(m_dec)
+
+            row: dict = {
+                "simbad_id": simbad_id,
+                "target_ra": ra_t,
+                "target_dec": dec_t,
+                "visit": visit,
+                "detector": detector,
+                "band": band,
+                "day_obs": day_obs,
+                "physical_filter": physical_filter,
+                "sep_arcsec": sep_arcsec,
+                "src_ra": m_ra,
+                "src_dec": m_dec,
+                "sourceId": (
+                    int(matched[id_col]) if id_col in matched.index and pd.notna(matched[id_col]) else np.nan
+                ),
+            }
+            for col in photo_cols:
+                row[col] = matched.get(col, np.nan)
+
+            batch.append(row)
+            del df_src, ra_arr, dec_arr, cat_sky, matched
+
+        if batch:
+            pd.DataFrame(batch).to_csv(out_csv, mode="a", header=False, index=False)
+            log.info("  flushed %d rows to disk", len(batch))
+        batch.clear()
+        gc.collect()
+
+        log.info("  matched: %d / %d refs  (load failures: %d)", n_matched, len(refs), n_failed)
+
+        summary_rows.append(
+            {
+                "simbad_id": simbad_id,
+                "ra_deg": ra_t,
+                "dec_deg": dec_t,
+                "n_refs": len(refs),
+                "n_matched": n_matched,
+                "n_failed": n_failed,
+                "status": "ok" if n_matched > 0 else "no_match",
+            }
+        )
+        # Flush the summary after EVERY target so a crash never loses more
+        # than the target currently in flight, and resume can pick up cleanly.
+        pd.DataFrame(summary_rows).to_csv(out_summary_csv, index=False)
+        n_processed_since_reset += 1
+
+    del butler
+    gc.collect()
+    log.info("Chunk done. Match summary saved -> %s", out_summary_csv)
+
+
+def merge_chunk_files(chunk_csv_paths: list[str], out_csv: str) -> None:
+    """Concatenate several chunk light-curve CSVs into *out_csv* by streaming
+    lines (no pandas involved), so RAM use stays independent of file size."""
+    if not chunk_csv_paths:
+        log.warning("merge_chunk_files: no chunk files given, nothing to do")
+        return
+    with open(out_csv, "w") as fout:
+        for i, fpath in enumerate(chunk_csv_paths):
+            with open(fpath) as fin:
+                header = fin.readline()
+                if i == 0:
+                    fout.write(header)
+                for line in fin:
+                    fout.write(line)
+    log.info("Merged %d chunk files -> %s", len(chunk_csv_paths), out_csv)
+
+
+def merge_chunk_summaries(chunk_summary_paths: list[str], out_summary_csv: str) -> pd.DataFrame:
+    """Concatenate the (small) per-chunk summary CSVs. These are tiny
+    (one row per target) so loading them fully in memory is fine."""
+    dfs = [pd.read_csv(p) for p in chunk_summary_paths if os.path.exists(p)]
+    df_summary = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+    df_summary.to_csv(out_summary_csv, index=False)
+    log.info("Merged %d chunk summaries -> %s (%d targets total)", len(dfs), out_summary_csv, len(df_summary))
+    return df_summary
+
+
+def csv_to_parquet_streaming(in_csv: str, out_parquet: str, chunksize: int = 200_000) -> None:
+    """Convert a (potentially large) CSV to Parquet by reading it in pages,
+    instead of `pd.read_csv(...).to_parquet(...)` which needs the whole
+    table in RAM at once."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    writer = None
+    n_rows = 0
+    try:
+        for chunk in pd.read_csv(in_csv, chunksize=chunksize):
+            table = pa.Table.from_pandas(chunk, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(out_parquet, table.schema)
+            writer.write_table(table)
+            n_rows += len(chunk)
+            del chunk, table
+            gc.collect()
+    finally:
+        if writer is not None:
+            writer.close()
+    log.info("Streaming CSV -> Parquet done (%d rows) -> %s", n_rows, out_parquet)
+
+
+def split_per_star_streaming(in_csv: str, dir_per_star: str, chunksize: int = 200_000) -> int:
+    """Write one CSV per star, reading *in_csv* in pages instead of loading
+    the full light-curve table in memory before grouping by star."""
+    os.makedirs(dir_per_star, exist_ok=True)
+    seen_stars: set[str] = set()
+    for chunk in pd.read_csv(in_csv, chunksize=chunksize):
+        for star_id, grp in chunk.groupby("simbad_id"):
+            fname = safe_name(str(star_id))
+            out_path = os.path.join(dir_per_star, f"{fname}_lc.csv")
+            write_header = not os.path.exists(out_path)
+            grp.to_csv(out_path, mode="a", header=write_header, index=False)
+            seen_stars.add(star_id)
+        del chunk
+        gc.collect()
+    log.info("Streaming per-star split done -> %d stars written to %s/", len(seen_stars), dir_per_star)
+    return len(seen_stars)
+
+
+def convert_per_star_to_parquet(dir_per_star: str) -> int:
+    """Convert each per-star CSV (small - one star's light curve) to Parquet,
+    one file at a time."""
+    csv_files = sorted(f for f in os.listdir(dir_per_star) if f.endswith("_lc.csv"))
+    for fname in csv_files:
+        base = fname[:-4]
+        df = pd.read_csv(os.path.join(dir_per_star, fname))
+        df.to_parquet(os.path.join(dir_per_star, base + ".parquet"), index=False)
+        del df
+        gc.collect()
+    log.info("Converted %d per-star CSV files to Parquet", len(csv_files))
+    return len(csv_files)
+
+
+def make_plots_streaming(
+    in_csv: str,
+    dir_per_star: str,
+    dir_figs: str,
+    match_radius: float,
+    chunksize: int = 200_000,
+    n_preview_stars: int = 6,
+) -> None:
+    """Diagnostic plots computed by streaming through *in_csv* in pages
+    (histogram / band counts are accumulated incrementally) instead of
+    requiring the full light-curve table in memory. The per-star flux
+    preview reads only a handful of already-small per-star CSV files."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(dir_figs, exist_ok=True)
+
+    def savefig(name: str) -> None:
+        for ext in ("pdf", "png"):
+            plt.savefig(os.path.join(dir_figs, f"{name}.{ext}"), bbox_inches="tight")
+        log.info("  -> saved %s.{pdf,png}", name)
+
+    # ── Pass 1: accumulate separation histogram + per-star/band counts ──
+    bin_edges = np.linspace(0, max(match_radius * 3, 1e-3), 31)
+    hist_counts = np.zeros(len(bin_edges) - 1)
+    band_counts: dict[tuple, int] = {}
+
+    for chunk in pd.read_csv(in_csv, usecols=["simbad_id", "band", "sep_arcsec"], chunksize=chunksize):
+        h, _ = np.histogram(chunk["sep_arcsec"].clip(upper=bin_edges[-1]), bins=bin_edges)
+        hist_counts += h
+        for key, n in chunk.groupby(["simbad_id", "band"]).size().items():
+            band_counts[key] = band_counts.get(key, 0) + n
+        del chunk
+        gc.collect()
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    ax.bar(centers, hist_counts, width=np.diff(bin_edges), edgecolor="k", linewidth=0.5)
+    ax.axvline(match_radius, color="red", ls="--", label=f'search radius = {match_radius}"')
+    ax.set_xlabel("Separation (arcsec)")
+    ax.set_ylabel("Number of matches")
+    ax.set_title("Cross-match separation - Simbad targets vs LSST sources (all visits)")
+    ax.legend()
+    plt.tight_layout()
+    savefig("lc_crossmatch_separation_histogram")
+    plt.close(fig)
+
+    if band_counts:
+        band_counts_series = pd.Series(band_counts)
+        band_counts_df = band_counts_series.unstack(fill_value=0)
+        fig, ax = plt.subplots(figsize=(max(6, len(band_counts_df) * 0.5), 4))
+        band_counts_df.plot(kind="bar", ax=ax, width=0.8)
+        ax.set_xlabel("Simbad target")
+        ax.set_ylabel("Number of matched visits")
+        ax.set_title("Visit count per star and band")
+        ax.legend(title="band", bbox_to_anchor=(1.01, 1), loc="upper left")
+        plt.xticks(rotation=45, ha="right", fontsize=7)
+        plt.tight_layout()
+        savefig("lc_visits_per_star_band")
+        plt.close(fig)
+
+    # ── psfFlux preview: only read the first N already-small per-star files ──
+    bands_to_plot = ["r", "g", "i", "u", "z", "y"]
+    band_colors = {"u": "purple", "g": "blue", "r": "green", "i": "orange", "z": "red", "y": "brown"}
+
+    star_files = sorted(f for f in os.listdir(dir_per_star) if f.endswith("_lc.csv"))[:n_preview_stars]
+    if not star_files:
+        return
+
+    dfs = [pd.read_csv(os.path.join(dir_per_star, f)) for f in star_files]
+    flux_col = None
+    for df in dfs:
+        if "psfFlux" in df.columns:
+            flux_col = "psfFlux"
+            break
+    if flux_col is None:
+        for df in dfs:
+            if "calibFlux" in df.columns:
+                flux_col = "calibFlux"
+                break
+
+    if flux_col:
+        n_stars = len(dfs)
+        fig, axes = plt.subplots(n_stars, 1, figsize=(10, 3 * n_stars), sharex=False)
+        if n_stars == 1:
+            axes = [axes]
+
+        for ax, df_star in zip(axes, dfs, strict=False):
+            star_id = df_star["simbad_id"].iloc[0] if "simbad_id" in df_star.columns else "?"
+            df_star = df_star.sort_values(["band", "visit"])
+            for band in bands_to_plot:
+                df_b = df_star[df_star["band"] == band]
+                if len(df_b) == 0:
+                    continue
+                x = np.arange(len(df_b))
+                y = df_b[flux_col].values
+                yerr = (
+                    df_b[flux_col + "Err"].values if flux_col + "Err" in df_b.columns else np.zeros(len(df_b))
+                )
+                ax.errorbar(
+                    x,
+                    y,
+                    yerr=yerr,
+                    fmt="o",
+                    ms=3,
+                    lw=0.8,
+                    color=band_colors.get(band, "gray"),
+                    label=f"{band} ({len(df_b)} pts)",
+                )
+            ax.set_title(star_id, fontsize=8)
+            ax.set_xlabel("Visit index (proxy - MJD to be added)")
+            ax.set_ylabel(f"{flux_col} [nJy]")
+            ax.legend(fontsize=7, ncol=3)
+
+        plt.suptitle(f"Light curves - {flux_col} (all bands)", y=1.01)
+        plt.tight_layout()
+        savefig("lc_psfFlux_preview")
+        plt.close(fig)
 
 
 # ===========================================================================
