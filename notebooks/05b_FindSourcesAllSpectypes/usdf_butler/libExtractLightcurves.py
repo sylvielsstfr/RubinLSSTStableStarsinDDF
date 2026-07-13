@@ -283,6 +283,9 @@ def extract_lightcurves(
         simbad_id = target["simbad_id"]
         ra_t = float(target["ra_deg"])
         dec_t = float(target["dec_deg"])
+        # field = target["field"]
+
+        # target coordinates
         tgt_sky = SkyCoord(ra=ra_t * u.deg, dec=dec_t * u.deg)
 
         log.info("[%3d] %s  ra=%.5f  dec=%+.5f", idx, simbad_id, ra_t, dec_t)
@@ -450,6 +453,7 @@ def extract_lightcurves(
 #     `.get()` calls and are NOT released by `gc.collect()` or `del`. Over a
 #     long target list this is the real source of the OOM crash, not the
 #     per-row Python objects (which are already freed).
+#
 #  2. The fix here is twofold:
 #       a) let the notebook process only a CHUNK of the target list per
 #          kernel run (`process_target_chunk`), so you can restart the
