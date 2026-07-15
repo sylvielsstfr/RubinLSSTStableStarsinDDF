@@ -8,6 +8,8 @@ per-star files and produces diagnostic plots.
 
 - `01_MatchTargetsWithLSSTCamSources.ipynb` — the notebook (config, schema
   probe, extraction loop, post-processing).
+- `01b_MatchTargetsWithLSSTCamSources.ipynb` — the notebook (config, schema
+  probe, skiip the extraction extraction loop done in the notebook `01_MatchTargetsWithLSSTCamSources.ipynb`, but do the post-processing).
 - `libExtractLightcurves.py` — all the logic used by the notebook:
   schema probing, the extraction loop, and post-processing helpers.
 - `data_DEEPCCUTOUTS_01_in/` — input target list.
@@ -22,7 +24,7 @@ runs out of memory. Two independent causes, and how each is addressed:
 1. **Extraction loop.** The LSST `Butler` accumulates internal
    registry/datastore caches across many thousands of `.get()` calls; these
    are not released by `gc.collect()` or `del`. `process_target_chunk(...)`
-   works around this by:
+   **works around this by**:
    - recreating the `Butler` every `reset_butler_every` targets (default 5),
    - flushing matched rows to disk after every target instead of
      accumulating them in memory,
